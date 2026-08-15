@@ -95,6 +95,7 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.api_run_context import TrustedApiRunContext
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -246,6 +247,23 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
 
 _REQUEST_OPTION_MISSING = object()
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_RUN_CONTEXT_HEADER = "X-Hermes-Run-Context"
+_RUN_CONTEXT_ID_HEADER = "X-Hermes-Run-Context-Id"
+_RUN_CONTEXT_SIGNATURE_HEADER = "X-Hermes-Run-Context-Signature"
+_RUN_CONTEXT_HEADERS = (
+    _RUN_CONTEXT_HEADER,
+    _RUN_CONTEXT_ID_HEADER,
+    _RUN_CONTEXT_SIGNATURE_HEADER,
+)
+_RUN_CONTEXT_NAME_RE = re.compile(r"^[a-z0-9_]{1,96}$")
+_RUN_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,512}$")
+_RUN_CONTEXT_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUN_CONTEXT_SECRET_ENV_RE = re.compile(
+    r"^[A-Z][A-Z0-9_]{0,111}_SIGNING_SECRET$"
+)
+_RUN_CONTEXT_TOOLSET_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
+_RUN_CONTEXT_REPLAY_TTL_SECONDS = 86_400.0
+_RUN_CONTEXT_REPLAY_MAX_CLAIMS = 10_000
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -1436,6 +1454,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # One-shot signed run contexts. Only a digest is retained; the opaque
+        # context id itself must never enter logs or public status payloads.
+        # Domain adapters remain the durable replay fence across restarts.
+        self._trusted_run_context_claims: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -2608,6 +2630,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        trusted_run_context: Optional[TrustedApiRunContext] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2641,6 +2664,10 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        ``trusted_run_context`` is validated by ``POST /v1/runs`` before this
+        method is called. Its configured toolsets replace the ordinary API
+        surface for that one run.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2872,7 +2899,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            list(trusted_run_context.toolsets)
+            if trusted_run_context is not None
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -2907,13 +2938,25 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "skip_context_files": trusted_run_context is not None,
+            "skip_memory": trusted_run_context is not None,
+            "skip_background_review": trusted_run_context is not None,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            # Signed one-purpose runs must never persist their prompt, tool
+            # traffic, or response into the profile's shared session store.
+            # ``_persist_disabled`` below prevents lazy persistence too; not
+            # handing the shared DB to the agent is an additional fail-closed
+            # boundary.
+            "session_db": (
+                None
+                if trusted_run_context is not None
+                else self._ensure_session_db()
+            ),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -2922,6 +2965,15 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if trusted_run_context is not None:
+            # AIAgent can lazily open a session database even when constructed
+            # without one. Disable all of its persistence seams before the run
+            # starts so signed context data remains strictly per-run.
+            agent._persist_disabled = True
+            # Signed one-purpose runs must not inherit prompt sections from
+            # unrelated plugins. The selected toolset remains available; only
+            # ambient plugin-authored system-prompt text is suppressed.
+            agent._plugin_system_prompt_sections_snapshot = ()
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3126,6 +3178,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "signed_run_contexts": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -6451,6 +6504,149 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _authenticate_trusted_run_context(
+        self,
+        request: "web.Request",
+    ) -> tuple[Optional[TrustedApiRunContext], Optional["web.Response"]]:
+        """Validate and one-shot claim an optional signed run context.
+
+        Unsigned ``/v1/runs`` requests retain the ordinary API-server
+        behavior. If any run-context header is present, all three must be
+        unique, canonical, and authenticated by a profile configuration that
+        replaces the run's toolsets. The opaque id and signature are never
+        logged or returned.
+        """
+
+        present = tuple(name in request.headers for name in _RUN_CONTEXT_HEADERS)
+        if not any(present):
+            return None, None
+
+        def _reject(
+            message: str = "Invalid signed run context",
+            *,
+            status: int = 401,
+            code: str = "invalid_run_context",
+        ) -> tuple[None, "web.Response"]:
+            return None, web.json_response(
+                _openai_error(message, code=code),
+                status=status,
+            )
+
+        if not all(present):
+            return _reject()
+
+        values: list[str] = []
+        for name in _RUN_CONTEXT_HEADERS:
+            all_values = request.headers.getall(name, [])
+            if len(all_values) != 1:
+                return _reject()
+            value = all_values[0]
+            if not isinstance(value, str) or value != value.strip():
+                return _reject()
+            values.append(value)
+        context_name, context_id, signature = values
+
+        if (
+            _RUN_CONTEXT_NAME_RE.fullmatch(context_name) is None
+            or _RUN_CONTEXT_ID_RE.fullmatch(context_id) is None
+            or _RUN_CONTEXT_SIGNATURE_RE.fullmatch(signature) is None
+        ):
+            return _reject()
+
+        from gateway.run import _load_gateway_config
+
+        config = _load_gateway_config()
+        gateway_config = config.get("gateway") if isinstance(config, dict) else None
+        api_config = (
+            gateway_config.get("api_server")
+            if isinstance(gateway_config, dict)
+            else None
+        )
+        trusted_contexts = (
+            api_config.get("trusted_run_contexts")
+            if isinstance(api_config, dict)
+            else None
+        )
+        context_config = (
+            trusted_contexts.get(context_name)
+            if isinstance(trusted_contexts, dict)
+            else None
+        )
+        if not isinstance(context_config, dict):
+            return _reject()
+
+        secret_env = context_config.get("signing_secret_env")
+        toolset_mode = context_config.get("toolset_mode")
+        raw_toolsets = context_config.get("toolsets")
+        if (
+            not isinstance(secret_env, str)
+            or _RUN_CONTEXT_SECRET_ENV_RE.fullmatch(secret_env) is None
+            or toolset_mode != "replace"
+            or not isinstance(raw_toolsets, list)
+            or not 1 <= len(raw_toolsets) <= 16
+            or any(
+                not isinstance(toolset, str)
+                or _RUN_CONTEXT_TOOLSET_RE.fullmatch(toolset) is None
+                for toolset in raw_toolsets
+            )
+            or len(set(raw_toolsets)) != len(raw_toolsets)
+        ):
+            return _reject(
+                "Signed run context is unavailable",
+                status=503,
+                code="run_context_unavailable",
+            )
+
+        secret = _get_scoped_secret(secret_env, "")
+        if not isinstance(secret, str) or len(secret) < 32:
+            return _reject(
+                "Signed run context is unavailable",
+                status=503,
+                code="run_context_unavailable",
+            )
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            f"{context_name}\n{context_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return _reject()
+
+        # Reject immediate transport replays without retaining the opaque id.
+        # Domain adapters provide the durable operation/expiry fence across a
+        # gateway restart; this cache closes the accepted-run replay window in
+        # the live process.
+        now = time.monotonic()
+        cutoff = now - _RUN_CONTEXT_REPLAY_TTL_SECONDS
+        if self._trusted_run_context_claims:
+            self._trusted_run_context_claims = {
+                digest: accepted_at
+                for digest, accepted_at in self._trusted_run_context_claims.items()
+                if accepted_at >= cutoff
+            }
+        claim_digest = hashlib.sha256(
+            f"{context_name}\0{context_id}\0{expected}".encode("utf-8")
+        ).hexdigest()
+        if claim_digest in self._trusted_run_context_claims:
+            return _reject(
+                "Signed run context was already accepted",
+                status=409,
+                code="run_context_replayed",
+            )
+        while len(self._trusted_run_context_claims) >= _RUN_CONTEXT_REPLAY_MAX_CLAIMS:
+            oldest = next(iter(self._trusted_run_context_claims))
+            del self._trusted_run_context_claims[oldest]
+        self._trusted_run_context_claims[claim_digest] = now
+
+        return (
+            TrustedApiRunContext(
+                name=context_name,
+                context_id=context_id,
+                toolsets=tuple(raw_toolsets),
+            ),
+            None,
+        )
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -6562,6 +6758,9 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
+        signed_context_requested = any(
+            name in request.headers for name in _RUN_CONTEXT_HEADERS
+        )
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -6588,6 +6787,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+
+        # Signed contexts are deliberately fresh, one-purpose runs. A caller
+        # may provide a display/session hint for compatibility, but it cannot
+        # restore history, a persisted system prompt, or long-term memory
+        # scope. The gateway replaces its session id below after allocating
+        # the private run id.
+        if signed_context_requested and (
+            gateway_session_key
+            or "conversation_history" in body
+            or previous_response_id is not None
+            or (isinstance(raw_input, list) and len(raw_input) > 1)
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Signed run contexts do not accept session history",
+                    code="run_context_history_forbidden",
+                ),
+                status=400,
+            )
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -6633,7 +6851,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or stored_session_id
+        session_id = (
+            None
+            if signed_context_requested
+            else body.get("session_id") or stored_session_id
+        )
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6645,6 +6867,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        trusted_run_context, context_error = self._authenticate_trusted_run_context(
+            request
+        )
+        if context_error is not None:
+            return context_error
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
@@ -6723,6 +6951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        trusted_run_context=trusted_run_context,
                     )
                 self._active_run_agents[run_id] = agent
 
@@ -6767,6 +6996,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    run_context_token = None
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -6786,6 +7016,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                             )
+                            if trusted_run_context is not None:
+                                from gateway.api_run_context import (
+                                    bind_trusted_api_run_context,
+                                )
+
+                                run_context_token = bind_trusted_api_run_context(
+                                    trusted_run_context
+                                )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
                             # TurnRunner, no _run_agent) — record turn process
@@ -6817,6 +7055,31 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
+                                if run_context_token is not None:
+                                    try:
+                                        from gateway.api_run_context import (
+                                            reset_trusted_api_run_context,
+                                        )
+
+                                        reset_trusted_api_run_context(
+                                            run_context_token
+                                        )
+                                    except Exception:
+                                        pass
+                                # /v1/runs creates a fresh, one-shot agent for
+                                # every request. Close it in the executor thread
+                                # after run_conversation has actually unwound so
+                                # cancellation cannot race live model/browser/
+                                # subprocess clients. Cleanup failures must not
+                                # replace the run's real result or exception.
+                                try:
+                                    agent.close()
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to close /v1/runs agent run=%s",
+                                        run_id,
+                                        exc_info=True,
+                                    )
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
