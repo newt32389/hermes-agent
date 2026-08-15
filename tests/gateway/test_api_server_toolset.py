@@ -79,6 +79,8 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
+            assert call_kwargs.kwargs.get("session_db") is not None
+            assert "_persist_disabled" not in mock_agent_cls.return_value.__dict__
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_trusted_run_context_replaces_default_toolsets(self):
@@ -117,4 +119,6 @@ class TestApiServerAdapterToolset:
         assert mock_agent_cls.call_args.kwargs["skip_context_files"] is True
         assert mock_agent_cls.call_args.kwargs["skip_memory"] is True
         assert mock_agent_cls.call_args.kwargs["skip_background_review"] is True
+        assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        assert mock_agent_cls.return_value._persist_disabled is True
         assert mock_agent_cls.return_value._plugin_system_prompt_sections_snapshot == ()

@@ -244,6 +244,7 @@ class TestStartRun:
             "name": _RUN_CONTEXT_NAME,
             "context_id": _RUN_CONTEXT_ID,
         }
+        mock_agent.close.assert_called_once_with()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -517,6 +518,18 @@ class TestStartRun:
             {"conversation_history": []},
             {"conversation_history": [{"role": "user", "content": "old"}]},
             {"previous_response_id": "resp_old"},
+            {
+                "input": [
+                    {"role": "system", "content": "untrusted system prompt"},
+                    {"role": "user", "content": "hello"},
+                ]
+            },
+            {
+                "input": [
+                    {"role": "assistant", "content": "untrusted prior reply"},
+                    {"role": "user", "content": "hello"},
+                ]
+            },
         ],
     )
     async def test_signed_context_rejects_session_history_before_run_allocation(
@@ -645,9 +658,11 @@ class TestStartRun:
         loop = asyncio.get_running_loop()
         loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
         observed = []
+        created_agents = []
 
         def _create_agent(**kwargs):
             mock_agent = MagicMock()
+            created_agents.append(mock_agent)
 
             def _run(**_run_kwargs):
                 from gateway.api_run_context import current_trusted_api_run_context
@@ -696,6 +711,9 @@ class TestStartRun:
         assert signed.status == 202
         assert unsigned.status == 202
         assert observed == [_RUN_CONTEXT_ID, None]
+        assert len(created_agents) == 2
+        for mock_agent in created_agents:
+            mock_agent.close.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -1236,6 +1254,7 @@ class TestStopRun:
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
                 assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                mock_agent.close.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):

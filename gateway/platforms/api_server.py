@@ -2966,7 +2966,16 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
-            "session_db": self._ensure_session_db(),
+            # Signed one-purpose runs must never persist their prompt, tool
+            # traffic, or response into the profile's shared session store.
+            # ``_persist_disabled`` below prevents lazy persistence too; not
+            # handing the shared DB to the agent is an additional fail-closed
+            # boundary.
+            "session_db": (
+                None
+                if trusted_run_context is not None
+                else self._ensure_session_db()
+            ),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
@@ -2976,6 +2985,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         agent = AIAgent(**agent_kwargs)
         if trusted_run_context is not None:
+            # AIAgent can lazily open a session database even when constructed
+            # without one. Disable all of its persistence seams before the run
+            # starts so signed context data remains strictly per-run.
+            agent._persist_disabled = True
             # Signed one-purpose runs must not inherit prompt sections from
             # unrelated plugins. The selected toolset remains available; only
             # ambient plugin-authored system-prompt text is suppressed.
@@ -6858,6 +6871,7 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key
             or "conversation_history" in body
             or previous_response_id is not None
+            or (isinstance(raw_input, list) and len(raw_input) > 1)
         ):
             return web.json_response(
                 _openai_error(
@@ -7126,6 +7140,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                         )
                                     except Exception:
                                         pass
+                                # /v1/runs creates a fresh, one-shot agent for
+                                # every request. Close it in the executor thread
+                                # after run_conversation has actually unwound so
+                                # cancellation cannot race live model/browser/
+                                # subprocess clients. Cleanup failures must not
+                                # replace the run's real result or exception.
+                                try:
+                                    agent.close()
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to close /v1/runs agent run=%s",
+                                        run_id,
+                                        exc_info=True,
+                                    )
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
