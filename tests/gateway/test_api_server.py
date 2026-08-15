@@ -868,6 +868,7 @@ class TestCapabilitiesEndpoint:
             assert data["runtime"]["split_runtime"] is False
             assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
+            assert data["features"]["signed_run_contexts"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
@@ -2865,4 +2866,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

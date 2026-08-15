@@ -80,3 +80,41 @@ class TestApiServerAdapterToolset:
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
 
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_trusted_run_context_replaces_default_toolsets(self):
+        """A signed run receives only its configured one-purpose surface."""
+        from gateway.api_run_context import TrustedApiRunContext
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+
+        adapter = APIServerAdapter(PlatformConfig())
+        context = TrustedApiRunContext(
+            name="bounded_context",
+            context_id="opaque_context_identifier_1234",
+            toolsets=("bounded_context",),
+        )
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_kwargs.return_value = {
+                "api_key": "test-key",
+                "base_url": None,
+                "provider": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+            mock_model.return_value = "test/model"
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(trusted_run_context=context)
+
+        assert mock_agent_cls.call_args.kwargs["enabled_toolsets"] == [
+            "bounded_context"
+        ]
+        assert mock_agent_cls.call_args.kwargs["skip_context_files"] is True
+        assert mock_agent_cls.call_args.kwargs["skip_memory"] is True
+        assert mock_agent_cls.call_args.kwargs["skip_background_review"] is True
+        assert mock_agent_cls.return_value._plugin_system_prompt_sections_snapshot == ()
