@@ -2,7 +2,11 @@
 
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
+import gateway.api_run_context as api_run_context
 from gateway.api_run_context import (
+    RunContextReplayStoreUnavailable,
     TrustedApiRunContext,
     bind_trusted_api_run_context,
     current_trusted_api_run_context,
@@ -43,3 +47,21 @@ def test_binding_does_not_leak_to_an_unbound_worker_thread():
         reset_trusted_api_run_context(token)
 
     assert observed is None
+
+
+def test_durable_claim_store_fails_closed_at_capacity_without_evicting_live_claims(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api_run_context, "_MAX_DURABLE_CLAIMS", 1)
+
+    assert api_run_context.claim_once_durably(
+        claim_digest="a" * 64, expires_at=9_999_999_999
+    )
+    with pytest.raises(RunContextReplayStoreUnavailable):
+        api_run_context.claim_once_durably(
+            claim_digest="b" * 64, expires_at=9_999_999_999
+        )
+    assert not api_run_context.claim_once_durably(
+        claim_digest="a" * 64, expires_at=9_999_999_999
+    )

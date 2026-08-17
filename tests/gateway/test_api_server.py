@@ -869,6 +869,7 @@ class TestCapabilitiesEndpoint:
             assert "API-server host" in data["runtime"]["description"]
             assert data["features"]["chat_completions"] is True
             assert data["features"]["signed_run_contexts"] is True
+            assert data["features"]["signed_run_contexts_v2"] is False
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True

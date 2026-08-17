@@ -12,6 +12,7 @@ Covers:
 import asyncio
 import hashlib
 import hmac
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -58,16 +59,29 @@ def _run_context_headers(
     context_name: str = _RUN_CONTEXT_NAME,
     context_id: str = _RUN_CONTEXT_ID,
     secret: str = _RUN_CONTEXT_SECRET,
+    body: dict | None = None,
+    expires_at: int | None = None,
 ) -> dict[str, str]:
+    body = body or {"input": "hello"}
+    expires_at = expires_at or int(time.time()) + 60
+    body_digest = hashlib.sha256(
+        json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode()
+    ).hexdigest()
     signature = hmac.new(
         secret.encode(),
-        f"{context_name}\n{context_id}".encode(),
+        (
+            f"v1\n{context_name}\n{context_id}\nhermes-api-server/v1/runs\n"
+            f"{expires_at}\n{body_digest}"
+        ).encode(),
         hashlib.sha256,
     ).hexdigest()
     return {
         "X-Hermes-Run-Context": context_name,
         "X-Hermes-Run-Context-Id": context_id,
         "X-Hermes-Run-Context-Signature": signature,
+        "X-Hermes-Run-Context-Claim": f"v1.{expires_at}.{body_digest}",
     }
 
 
@@ -165,6 +179,27 @@ def auth_adapter():
 
 
 class TestStartRun:
+    def test_signed_context_v2_capability_requires_configured_secret(
+        self, adapter, monkeypatch
+    ):
+        assert not adapter._signed_run_contexts_v2_available()
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        with patch(
+            "gateway.run._load_gateway_config", return_value=_run_context_config()
+        ):
+            assert adapter._signed_run_contexts_v2_available()
+
+    def test_signed_context_v2_capability_reuses_closed_toolset_validator(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        config = _run_context_config()
+        config["gateway"]["api_server"]["trusted_run_contexts"][_RUN_CONTEXT_NAME][
+            "toolsets"
+        ] = [f"toolset_{index}" for index in range(17)]
+        with patch("gateway.run._load_gateway_config", return_value=config):
+            assert not adapter._signed_run_contexts_v2_available()
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -222,11 +257,12 @@ class TestStartRun:
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
                 mock_create.return_value = mock_agent
+                headers = _run_context_headers()
 
                 resp = await cli.post(
                     "/v1/runs",
                     json={"input": "hello"},
-                    headers=_run_context_headers(),
+                    headers=headers,
                 )
                 assert resp.status == 202
                 run_id = (await resp.json())["run_id"]
@@ -349,22 +385,142 @@ class TestStartRun:
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
                 mock_create.return_value = mock_agent
+                headers = _run_context_headers()
 
                 first = await cli.post(
                     "/v1/runs",
                     json={"input": "hello"},
-                    headers=_run_context_headers(),
+                    headers=headers,
                 )
                 replay = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello again"},
-                    headers=_run_context_headers(),
+                    json={"input": "hello"},
+                    headers=headers,
                 )
                 body = await replay.json()
 
         assert first.status == 202
         assert replay.status == 409
         assert body["error"]["code"] == "run_context_replayed"
+
+    @pytest.mark.asyncio
+    async def test_signed_context_rejects_body_alteration_before_agent_allocation(
+        self, adapter, monkeypatch
+    ):
+        app = _create_runs_app(adapter)
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        headers = _run_context_headers(body={"input": "approved action"})
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=_run_context_config()
+            ), patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post(
+                    "/v1/runs", json={"input": "altered action"}, headers=headers
+                )
+                payload = await response.json()
+
+        assert response.status == 401
+        assert payload["error"]["code"] == "invalid_run_context"
+        mock_create.assert_not_called()
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_signed_context_expiry_is_rejected_before_agent_allocation(
+        self, adapter, monkeypatch
+    ):
+        app = _create_runs_app(adapter)
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        headers = _run_context_headers(expires_at=int(time.time()) - 6)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=_run_context_config()
+            ), patch.object(adapter, "_create_agent") as mock_create:
+                response = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                payload = await response.json()
+
+        assert response.status == 401
+        assert payload["error"]["code"] == "run_context_expired"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_signed_context_replay_survives_adapter_restart(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        headers = _run_context_headers()
+
+        first_adapter = _make_adapter()
+        first_app = _create_runs_app(first_adapter)
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=_run_context_config()
+            ), patch.object(first_adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                mock_create.return_value = agent
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+
+        restarted_adapter = _make_adapter()
+        restarted_app = _create_runs_app(restarted_adapter)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=_run_context_config()
+            ), patch.object(restarted_adapter, "_create_agent") as mock_create:
+                replay = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                payload = await replay.json()
+
+        assert first.status == 202
+        assert replay.status == 409
+        assert payload["error"]["code"] == "run_context_replayed"
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_boundary_accepted_claim_survives_restart_replay_fence(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        now = 2_000_000_000
+        monkeypatch.setattr("gateway.api_run_context.time.time", lambda: now)
+        headers = _run_context_headers(expires_at=now - 5)
+
+        first_adapter = _make_adapter()
+        async with TestClient(TestServer(_create_runs_app(first_adapter))) as cli:
+            with (
+                patch(
+                    "gateway.run._load_gateway_config",
+                    return_value=_run_context_config(),
+                ),
+                patch.object(first_adapter, "_create_agent") as mock_create,
+            ):
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                mock_create.return_value = agent
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+
+        restarted_adapter = _make_adapter()
+        async with TestClient(TestServer(_create_runs_app(restarted_adapter))) as cli:
+            with (
+                patch(
+                    "gateway.run._load_gateway_config",
+                    return_value=_run_context_config(),
+                ),
+                patch.object(restarted_adapter, "_create_agent") as mock_create,
+            ):
+                replay = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                payload = await replay.json()
+
+        assert first.status == 202
+        assert replay.status == 409
+        assert payload["error"]["code"] == "run_context_replayed"
+        mock_create.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -496,7 +652,9 @@ class TestStartRun:
                 resp = await cli.post(
                     "/v1/runs",
                     json={"input": "hello", "instructions": "bounded task"},
-                    headers=_run_context_headers(),
+                    headers=_run_context_headers(
+                        body={"input": "hello", "instructions": "bounded task"}
+                    ),
                 )
                 run_id = (await resp.json())["run_id"]
                 for _ in range(40):
@@ -574,7 +732,9 @@ class TestStartRun:
                 resp = await cli.post(
                     "/v1/runs",
                     json={"input": "hello", "session_id": "caller-session"},
-                    headers=_run_context_headers(),
+                    headers=_run_context_headers(
+                        body={"input": "hello", "session_id": "caller-session"}
+                    ),
                 )
                 run_id = (await resp.json())["run_id"]
                 for _ in range(40):
@@ -714,6 +874,140 @@ class TestStartRun:
         assert len(created_agents) == 2
         for mock_agent in created_agents:
             mock_agent.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_signed_context_id_is_redacted_from_failure_status_and_logs(
+        self, adapter, monkeypatch, caplog
+    ):
+        app = _create_runs_app(adapter)
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        caplog.set_level("ERROR")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=_run_context_config()
+            ), patch.object(adapter, "_create_agent") as mock_create:
+                agent = MagicMock()
+                agent.run_conversation.side_effect = RuntimeError(
+                    f"selected plugin rejected {_RUN_CONTEXT_ID}"
+                )
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                mock_create.return_value = agent
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_run_context_headers()
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert response.status == 202
+        assert status["status"] == "failed"
+        assert _RUN_CONTEXT_ID not in str(status)
+        assert "[redacted run context]" in str(status)
+        assert _RUN_CONTEXT_ID not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_signed_context_rejects_unsigned_steering(self, adapter, monkeypatch):
+        app = _create_runs_app(adapter)
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        agent, ready, _interrupted = _make_slow_agent()
+        agent.steer = MagicMock(return_value=True)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch(
+                    "gateway.run._load_gateway_config",
+                    return_value=_run_context_config(),
+                ),
+                patch.object(adapter, "_create_agent", return_value=agent),
+            ):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_run_context_headers()
+                )
+                run_id = (await response.json())["run_id"]
+                assert ready.wait(timeout=3)
+                steer = await cli.post(
+                    f"/v1/runs/{run_id}/steer", json={"input": "unsigned change"}
+                )
+                payload = await steer.json()
+                await cli.post(f"/v1/runs/{run_id}/stop")
+
+        assert steer.status == 409
+        assert payload["error"]["code"] == "run_context_steer_forbidden"
+        assert _RUN_CONTEXT_ID not in str(payload)
+        agent.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_signed_context_rejects_persistent_approval_choice(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_signed", "running")
+        adapter._run_context_redactions["run_signed"] = _RUN_CONTEXT_ID
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_signed/approval", json={"choice": "always"}
+            )
+            payload = await response.json()
+
+        assert response.status == 409
+        assert payload["error"]["code"] == "run_context_approval_forbidden"
+        assert _RUN_CONTEXT_ID not in str(payload)
+
+    @pytest.mark.asyncio
+    async def test_signed_context_rejects_mass_approval_even_once(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_signed", "running")
+        adapter._run_context_redactions["run_signed"] = _RUN_CONTEXT_ID
+
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs/run_signed/approval", json={"choice": "once", "all": True}
+            )
+            payload = await response.json()
+
+        assert response.status == 409
+        assert payload["error"]["code"] == "run_context_approval_forbidden"
+
+    @pytest.mark.asyncio
+    async def test_signed_context_approval_event_offers_only_once_or_deny(
+        self, adapter, monkeypatch
+    ):
+        app = _create_runs_app(adapter)
+        monkeypatch.setenv(_RUN_CONTEXT_SECRET_ENV, _RUN_CONTEXT_SECRET)
+        agent = MagicMock()
+
+        def _run(*, task_id, **_kwargs):
+            approval_mod._gateway_notify_cbs[task_id]({"allow_permanent": True})
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch(
+                    "gateway.run._load_gateway_config",
+                    return_value=_run_context_config(),
+                ),
+                patch.object(adapter, "_create_agent", return_value=agent),
+            ):
+                response = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_run_context_headers()
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        events = []
+        while not adapter._run_streams[run_id].empty():
+            events.append(adapter._run_streams[run_id].get_nowait())
+        approval_event = next(event for event in events if event and event["event"] == "approval.request")
+        assert approval_event["choices"] == ["once", "deny"]
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):

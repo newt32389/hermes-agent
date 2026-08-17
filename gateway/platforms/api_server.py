@@ -95,7 +95,16 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
-from gateway.api_run_context import TrustedApiRunContext
+from gateway.api_run_context import (
+    RUN_CONTEXT_AUDIENCE,
+    RUN_CONTEXT_CLOCK_SKEW_SECONDS,
+    TrustedApiRunContext,
+    RunContextReplayStoreUnavailable,
+    canonical_request_digest,
+    canonical_signature_payload,
+    claim_once_durably,
+    durable_claim_store_available,
+)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -250,20 +259,60 @@ _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhi
 _RUN_CONTEXT_HEADER = "X-Hermes-Run-Context"
 _RUN_CONTEXT_ID_HEADER = "X-Hermes-Run-Context-Id"
 _RUN_CONTEXT_SIGNATURE_HEADER = "X-Hermes-Run-Context-Signature"
+_RUN_CONTEXT_CLAIM_HEADER = "X-Hermes-Run-Context-Claim"
 _RUN_CONTEXT_HEADERS = (
     _RUN_CONTEXT_HEADER,
     _RUN_CONTEXT_ID_HEADER,
     _RUN_CONTEXT_SIGNATURE_HEADER,
+    _RUN_CONTEXT_CLAIM_HEADER,
 )
 _RUN_CONTEXT_NAME_RE = re.compile(r"^[a-z0-9_]{1,96}$")
 _RUN_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,512}$")
 _RUN_CONTEXT_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUN_CONTEXT_CLAIM_RE = re.compile(r"^v1\.([0-9]{10})\.([0-9a-f]{64})$")
 _RUN_CONTEXT_SECRET_ENV_RE = re.compile(
     r"^[A-Z][A-Z0-9_]{0,111}_SIGNING_SECRET$"
 )
 _RUN_CONTEXT_TOOLSET_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _RUN_CONTEXT_REPLAY_TTL_SECONDS = 86_400.0
 _RUN_CONTEXT_REPLAY_MAX_CLAIMS = 10_000
+
+
+def _validated_trusted_run_context_config(
+    config: Any, context_name: str
+) -> tuple[str, tuple[str, ...]] | None:
+    """Return the closed trusted-context configuration accepted by the gateway."""
+    if _RUN_CONTEXT_NAME_RE.fullmatch(context_name) is None:
+        return None
+    gateway_config = config.get("gateway") if isinstance(config, dict) else None
+    api_config = (
+        gateway_config.get("api_server") if isinstance(gateway_config, dict) else None
+    )
+    trusted_contexts = (
+        api_config.get("trusted_run_contexts") if isinstance(api_config, dict) else None
+    )
+    context_config = (
+        trusted_contexts.get(context_name) if isinstance(trusted_contexts, dict) else None
+    )
+    if not isinstance(context_config, dict):
+        return None
+    secret_env = context_config.get("signing_secret_env")
+    raw_toolsets = context_config.get("toolsets")
+    if (
+        not isinstance(secret_env, str)
+        or _RUN_CONTEXT_SECRET_ENV_RE.fullmatch(secret_env) is None
+        or context_config.get("toolset_mode") != "replace"
+        or not isinstance(raw_toolsets, list)
+        or not 1 <= len(raw_toolsets) <= 16
+        or any(
+            not isinstance(toolset, str)
+            or _RUN_CONTEXT_TOOLSET_RE.fullmatch(toolset) is None
+            for toolset in raw_toolsets
+        )
+        or len(set(raw_toolsets)) != len(raw_toolsets)
+    ):
+        return None
+    return secret_env, tuple(raw_toolsets)
 _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "api_key",
     "base_url",
@@ -1458,6 +1507,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # context id itself must never enter logs or public status payloads.
         # Domain adapters remain the durable replay fence across restarts.
         self._trusted_run_context_claims: Dict[str, float] = {}
+        # Exact opaque IDs used only to scrub data leaving a signed run.  The
+        # identifier is removed as soon as the terminal stream is released.
+        self._run_context_redactions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -3173,6 +3225,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        signed_contexts_v2_available = self._signed_run_contexts_v2_available()
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3198,6 +3251,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "signed_run_contexts": True,
+                # v2 is ready only when at least one complete trusted context
+                # and its secret are available in this profile.  Clients must
+                # require this, not the legacy surface-advertisement boolean.
+                "signed_run_contexts_v2": signed_contexts_v2_available,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -6578,9 +6635,44 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
+    def _signed_run_contexts_v2_available(self) -> bool:
+        """Whether this profile can actually authenticate at least one v2 claim."""
+        try:
+            if not durable_claim_store_available():
+                return False
+            from gateway.run import _load_gateway_config
+
+            config = _load_gateway_config()
+            gateway_config = config.get("gateway") if isinstance(config, dict) else None
+            api_config = gateway_config.get("api_server") if isinstance(gateway_config, dict) else None
+            trusted_contexts = api_config.get("trusted_run_contexts") if isinstance(api_config, dict) else None
+            if not isinstance(trusted_contexts, dict):
+                return False
+            for name in trusted_contexts:
+                if not isinstance(name, str):
+                    continue
+                validated = _validated_trusted_run_context_config(config, name)
+                if validated is None:
+                    continue
+                secret_env, _toolsets = validated
+                secret = (
+                    _get_scoped_secret(secret_env, "")
+                    if isinstance(secret_env, str)
+                    else ""
+                )
+                if (
+                    isinstance(secret, str)
+                    and len(secret) >= 32
+                ):
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _authenticate_trusted_run_context(
         self,
         request: "web.Request",
+        body: Dict[str, Any],
     ) -> tuple[Optional[TrustedApiRunContext], Optional["web.Response"]]:
         """Validate and one-shot claim an optional signed run context.
 
@@ -6618,7 +6710,7 @@ class APIServerAdapter(BasePlatformAdapter):
             if not isinstance(value, str) or value != value.strip():
                 return _reject()
             values.append(value)
-        context_name, context_id, signature = values
+        context_name, context_id, signature, claim = values
 
         if (
             _RUN_CONTEXT_NAME_RE.fullmatch(context_name) is None
@@ -6626,6 +6718,24 @@ class APIServerAdapter(BasePlatformAdapter):
             or _RUN_CONTEXT_SIGNATURE_RE.fullmatch(signature) is None
         ):
             return _reject()
+        claim_match = _RUN_CONTEXT_CLAIM_RE.fullmatch(claim)
+        if claim_match is None:
+            return _reject()
+        expires_at = int(claim_match.group(1))
+        body_digest = claim_match.group(2)
+        # Allow modest clock skew but never accept an open-ended credential.
+        now_wall = time.time()
+        if (
+            expires_at < now_wall - RUN_CONTEXT_CLOCK_SKEW_SECONDS
+            or expires_at > now_wall + 300
+        ):
+            return _reject("Signed run context has expired", code="run_context_expired")
+        try:
+            actual_body_digest = canonical_request_digest(body)
+        except (TypeError, ValueError):
+            return _reject()
+        if not hmac.compare_digest(body_digest, actual_body_digest):
+            return _reject("Signed run context request binding is invalid")
 
         from gateway.run import _load_gateway_config
 
@@ -6641,35 +6751,16 @@ class APIServerAdapter(BasePlatformAdapter):
             if isinstance(api_config, dict)
             else None
         )
-        context_config = (
-            trusted_contexts.get(context_name)
-            if isinstance(trusted_contexts, dict)
-            else None
-        )
-        if not isinstance(context_config, dict):
+        if not isinstance(trusted_contexts, dict) or context_name not in trusted_contexts:
             return _reject()
-
-        secret_env = context_config.get("signing_secret_env")
-        toolset_mode = context_config.get("toolset_mode")
-        raw_toolsets = context_config.get("toolsets")
-        if (
-            not isinstance(secret_env, str)
-            or _RUN_CONTEXT_SECRET_ENV_RE.fullmatch(secret_env) is None
-            or toolset_mode != "replace"
-            or not isinstance(raw_toolsets, list)
-            or not 1 <= len(raw_toolsets) <= 16
-            or any(
-                not isinstance(toolset, str)
-                or _RUN_CONTEXT_TOOLSET_RE.fullmatch(toolset) is None
-                for toolset in raw_toolsets
-            )
-            or len(set(raw_toolsets)) != len(raw_toolsets)
-        ):
+        validated_config = _validated_trusted_run_context_config(config, context_name)
+        if validated_config is None:
             return _reject(
                 "Signed run context is unavailable",
                 status=503,
                 code="run_context_unavailable",
             )
+        secret_env, raw_toolsets = validated_config
 
         secret = _get_scoped_secret(secret_env, "")
         if not isinstance(secret, str) or len(secret) < 32:
@@ -6680,16 +6771,19 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         expected = hmac.new(
             secret.encode("utf-8"),
-            f"{context_name}\n{context_id}".encode("utf-8"),
+            canonical_signature_payload(
+                context_name=context_name,
+                context_id=context_id,
+                expires_at=expires_at,
+                body_digest=body_digest,
+            ),
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(signature, expected):
             return _reject()
 
-        # Reject immediate transport replays without retaining the opaque id.
-        # Domain adapters provide the durable operation/expiry fence across a
-        # gateway restart; this cache closes the accepted-run replay window in
-        # the live process.
+        # The durable claim must precede agent allocation.  It survives process
+        # restarts and cache eviction; a full/unavailable store fails closed.
         now = time.monotonic()
         cutoff = now - _RUN_CONTEXT_REPLAY_TTL_SECONDS
         if self._trusted_run_context_claims:
@@ -6699,8 +6793,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 if accepted_at >= cutoff
             }
         claim_digest = hashlib.sha256(
-            f"{context_name}\0{context_id}\0{expected}".encode("utf-8")
+            f"{context_name}\0{context_id}\0{RUN_CONTEXT_AUDIENCE}\0{claim}".encode("utf-8")
         ).hexdigest()
+        try:
+            durable_claimed = claim_once_durably(
+                claim_digest=claim_digest, expires_at=expires_at
+            )
+        except RunContextReplayStoreUnavailable:
+            return _reject(
+                "Signed run context is temporarily unavailable",
+                status=503,
+                code="run_context_unavailable",
+            )
+        if not durable_claimed:
+            return _reject(
+                "Signed run context was already accepted",
+                status=409,
+                code="run_context_replayed",
+            )
         if claim_digest in self._trusted_run_context_claims:
             return _reject(
                 "Signed run context was already accepted",
@@ -6732,13 +6842,31 @@ class APIServerAdapter(BasePlatformAdapter):
             "updated_at": now,
         })
         current.setdefault("created_at", fields.pop("created_at", now))
-        current.update(fields)
+        current.update(self._redact_run_context_value(run_id, fields))
         self._run_statuses[run_id] = current
         return current
+
+    def _redact_run_context_value(self, run_id: str, value: Any) -> Any:
+        """Remove the exact opaque signed-context ID from all run egress."""
+        context_id = self._run_context_redactions.get(run_id)
+        if not context_id:
+            return value
+        if isinstance(value, str):
+            return redact_sensitive_text(
+                value.replace(context_id, "[redacted run context]"), force=True
+            )
+        if isinstance(value, dict):
+            return {key: self._redact_run_context_value(run_id, item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact_run_context_value(run_id, item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_run_context_value(run_id, item) for item in value)
+        return value
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
+            event = self._redact_run_context_value(run_id, event)
             self._set_run_status(
                 run_id,
                 self._run_statuses.get(run_id, {}).get("status", "running"),
@@ -6943,12 +7071,14 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         trusted_run_context, context_error = self._authenticate_trusted_run_context(
-            request
+            request, body
         )
         if context_error is not None:
             return context_error
 
         run_id = f"run_{uuid.uuid4().hex}"
+        if trusted_run_context is not None:
+            self._run_context_redactions[run_id] = trusted_run_context.context_id
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -6969,7 +7099,11 @@ class APIServerAdapter(BasePlatformAdapter):
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+                q.put_nowait(
+                    self._redact_run_context_value(run_id, event)
+                    if event is not None
+                    else None
+                )
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6982,7 +7116,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "delta": delta,
+                    "delta": self._redact_run_context_value(run_id, delta),
                 })
             except Exception:
                 pass
@@ -7043,9 +7177,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
+                        "choices": (
+                            ["once", "deny"]
+                            if trusted_run_context is not None
+                            else _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            )
                         ),
                     })
                     self._set_run_status(
@@ -7054,7 +7192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        loop.call_soon_threadsafe(_put_event_if_active, event)
                     except Exception:
                         pass
 
@@ -7237,8 +7375,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # message the other endpoints give a provider auth/credential
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
-                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                error_msg = self._redact_run_context_value(
+                    run_id, f"⚠️ Provider authentication failed: {exc}"
+                )
+                logger.warning("Provider authentication failed for run=%s: %s", run_id, error_msg)
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -7255,11 +7395,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
+                # Tracebacks can include contextual plugin exceptions.  Do not
+                # emit one for signed runs because logger formatters cannot
+                # reliably redact exception frames after the fact.
+                error_msg = self._redact_run_context_value(
+                    run_id, _redact_api_error_text(exc)
+                )
+                if trusted_run_context is None:
+                    logger.exception("[api_server] run %s failed", run_id)
+                else:
+                    logger.error("[api_server] signed run %s failed: %s", run_id, error_msg)
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_redact_api_error_text(exc),
+                    error=error_msg,
                     last_event="run.failed",
                 )
                 try:
@@ -7267,7 +7416,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
+                        "error": error_msg,
                     })
                 except Exception:
                     pass
@@ -7370,7 +7519,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 payload = _sse_frame(event)
                 await response.write(payload)
         except Exception as exc:
-            logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
+            logger.debug(
+                "[api_server] SSE stream error for run %s: %s",
+                run_id,
+                self._redact_run_context_value(run_id, str(exc)),
+            )
         finally:
             self._run_stream_subscribers.discard(run_id)
             self._run_streams.pop(run_id, None)
@@ -7410,7 +7563,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        if run_id in self._run_context_redactions and choice not in {"once", "deny"}:
+            return web.json_response(
+                _openai_error(
+                    "Signed run contexts only permit one-time or deny approval",
+                    code="run_context_approval_forbidden",
+                ),
+                status=409,
+            )
 
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        if run_id in self._run_context_redactions and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "Signed run contexts do not permit resolving multiple approvals",
+                    code="run_context_approval_forbidden",
+                ),
+                status=409,
+            )
         approval_session_key = self._run_approval_sessions.get(run_id)
         if not approval_session_key:
             return web.json_response(
@@ -7420,11 +7593,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
-
-        resolve_all = (
-            _coerce_request_bool(body.get("all"), default=False)
-            or _coerce_request_bool(body.get("resolve_all"), default=False)
-        )
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7434,8 +7602,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 resolve_all=resolve_all,
             )
         except Exception as exc:
-            logger.exception("[api_server] approval resolution failed for run %s", run_id)
-            return web.json_response(_openai_error(str(exc)), status=500)
+            error_text = self._redact_run_context_value(run_id, str(exc))
+            if run_id in self._run_context_redactions:
+                logger.error(
+                    "[api_server] signed run approval resolution failed for run %s: %s",
+                    run_id,
+                    error_text,
+                )
+            else:
+                logger.exception("[api_server] approval resolution failed for run %s", run_id)
+            return web.json_response(_openai_error(error_text), status=500)
 
         if resolved <= 0:
             return web.json_response(
@@ -7450,13 +7626,18 @@ class APIServerAdapter(BasePlatformAdapter):
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
+                q.put_nowait(
+                    self._redact_run_context_value(
+                        run_id,
+                        {
+                            "event": "approval.responded",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "choice": choice,
+                            "resolved": resolved,
+                        },
+                    )
+                )
             except Exception:
                 pass
 
@@ -7477,6 +7658,17 @@ class APIServerAdapter(BasePlatformAdapter):
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        # A signed context authenticates only its original, body-bound
+        # request.  Later steering has no corresponding signed claim and
+        # would widen that authority, so it is never permitted.
+        if run_id in self._run_context_redactions:
+            return web.json_response(
+                _openai_error(
+                    "Signed run contexts do not accept steer input",
+                    code="run_context_steer_forbidden",
+                ),
+                status=409,
+            )
         # Only genuinely running runs are steerable.  /stop retains agent/task
         # refs during cooperative shutdown, so the status gate (not the mere
         # presence of an agent ref) is what rejects stop-then-steer.
@@ -7606,6 +7798,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_context_redactions.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
