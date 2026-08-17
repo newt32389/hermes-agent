@@ -17,6 +17,11 @@ the redactor regexes so the assertions stay meaningful, but contain no real
 or real-looking key, so secret scanners do not flag this file.
 """
 
+import asyncio
+import threading
+
+import pytest
+
 from gateway.run import _redact_approval_command
 
 # Synthetic, scanner-safe credential fixtures. Each matches its redactor
@@ -62,13 +67,10 @@ class TestRedactApprovalCommand:
 
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
-    1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
-    2. the SSE/API path (_approval_notify in gateway/platforms/api_server.py),
-    each of which must route the command through _redact_approval_command and
-    REASSIGN the redacted value before any send/enqueue (so the raw command
-    cannot reach a client). Uses AST (not char-offset string slicing) so a
-    benign refactor doesn't cause a false failure, and so a discarded-result
-    call (`_redact(cmd); send(cmd)`) does NOT pass."""
+    The chat-platform seam is source-level coverage. The API path has a
+    behavior-level signed-context test below because its final delivery is
+    intentionally mediated by the active-run fence rather than a direct queue
+    write."""
 
     def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str):
         """Parse `module`'s full AST, locate the (possibly nested) function
@@ -115,10 +117,117 @@ class TestApprovalCommandWiring:
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
-    def test_sse_api_path_redacts_before_enqueue(self):
-        from gateway.platforms import api_server
+    @pytest.mark.asyncio
+    async def test_signed_api_approval_event_is_redacted_and_active_fenced(
+        self, monkeypatch
+    ):
+        """A signed approval notification is redacted and cannot outlive SSE.
 
-        self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
+        This drives the actual nested API callback rather than constraining its
+        implementation detail.  The first notification proves delivery and
+        exact-ID redaction; after the stream is detached, a second notification
+        must not be enqueued into the retired queue.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import (
+            APIServerAdapter,
+            cors_middleware,
+            security_headers_middleware,
+        )
+        from tools import approval as approval_mod
+
+        context_name = "fitness_mobile_plan_generation"
+        context_id = "dispatch_abcdefghijklmnopqrstuvwxyz012345"
+        secret_name = "TEST_HERMES_RUN_CONTEXT_SIGNING_SECRET"
+        secret = "s" * 64
+        monkeypatch.setenv(secret_name, secret)
+        config = {
+            "gateway": {
+                "api_server": {
+                    "trusted_run_contexts": {
+                        context_name: {
+                            "signing_secret_env": secret_name,
+                            "toolset_mode": "replace",
+                            "toolsets": [context_name],
+                        }
+                    }
+                }
+            }
+        }
+        payload = {"input": "hello"}
+        import hashlib
+        import hmac
+        import json
+        import time
+
+        expires_at = int(time.time()) + 60
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        signature = hmac.new(
+            secret.encode(),
+            (
+                f"v1\n{context_name}\n{context_id}\nhermes-api-server/v1/runs\n"
+                f"{expires_at}\n{digest}"
+            ).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        headers = {
+            "X-Hermes-Run-Context": context_name,
+            "X-Hermes-Run-Context-Id": context_id,
+            "X-Hermes-Run-Context-Signature": signature,
+            "X-Hermes-Run-Context-Claim": f"v1.{expires_at}.{digest}",
+        }
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+        app = web.Application(
+            middlewares=[mw for mw in (cors_middleware, security_headers_middleware) if mw]
+        )
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        first_sent = threading.Event()
+        release_second = threading.Event()
+        agent = MagicMock()
+
+        def _run(*, task_id, **_kwargs):
+            callback = approval_mod._gateway_notify_cbs[task_id]
+            callback({"command": f"echo {context_id} {_FAKE_GHP}"})
+            first_sent.set()
+            release_second.wait(timeout=3)
+            callback({"command": f"echo {context_id} second"})
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = _run
+        agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+        async with TestClient(TestServer(app)) as client:
+            with (
+                patch("gateway.run._load_gateway_config", return_value=config),
+                patch.object(adapter, "_create_agent", return_value=agent),
+            ):
+                response = await client.post("/v1/runs", json=payload, headers=headers)
+                run_id = (await response.json())["run_id"]
+                assert first_sent.wait(timeout=3)
+                queue = adapter._run_streams[run_id]
+                for _ in range(40):
+                    if not queue.empty():
+                        break
+                    await asyncio.sleep(0.05)
+                event = queue.get_nowait()
+                assert event["event"] == "approval.request"
+                assert context_id not in str(event)
+                assert _FAKE_GHP not in str(event)
+                assert "[redacted run context]" in str(event)
+                adapter._run_streams.pop(run_id)
+                release_second.set()
+                for _ in range(40):
+                    if adapter._run_statuses.get(run_id, {}).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert queue.empty()
 
 
 class TestApprovalTextFallbackContract:
@@ -134,5 +243,3 @@ class TestApprovalTextFallbackContract:
         assert "`/approve`" in text
         assert "approve session" not in text
         assert "approve always" not in text
-
-
