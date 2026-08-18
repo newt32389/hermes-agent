@@ -21,6 +21,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -48,6 +49,15 @@ def _env_float(name: str, default: float) -> float:
 
 _WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
 _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
+# Keep this aligned with the gateway's off-critical-path late-refresh bound.
+# Unlike normal slash-worker startup, this only runs on a user's explicit
+# `/tools` request, whose purpose is to report the registry as completely as
+# possible.
+_TOOLS_MCP_DISCOVERY_WAIT_S = 30.0
+# The parent starts this deadline when it writes the request, not when this
+# worker starts.  Reserve time for command rendering and the JSON response so
+# `/tools` never turns a slow MCP into the parent's 5030 timeout.
+_TOOLS_RESPONSE_SAFETY_MARGIN_S = 3.0
 _in_flight = threading.Event()  # set while a command is executing
 logger = logging.getLogger(__name__)
 
@@ -55,6 +65,17 @@ logger = logging.getLogger(__name__)
 def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
     """Return whether this worker no longer has its original POSIX parent."""
     return getppid() != original_ppid
+
+
+def _tools_mcp_discovery_wait_s(request_deadline: float) -> float:
+    """Return the `/tools` completion wait within the parent's request budget."""
+    return max(0.0, min(_TOOLS_MCP_DISCOVERY_WAIT_S, request_deadline - time.monotonic()))
+
+
+def _slash_request_deadline(received_at: float) -> float:
+    """Set the per-request deadline to the parent's timeout minus response headroom."""
+    parent_timeout = max(5.0, _env_float("HERMES_TUI_SLASH_TIMEOUT_S", 45.0))
+    return received_at + parent_timeout - _TOOLS_RESPONSE_SAFETY_MARGIN_S
 
 
 def _prepare_slash_worker_runtime() -> None:
@@ -90,12 +111,29 @@ def _start_parent_death_watchdog(original_ppid) -> None:
     threading.Thread(target=_loop, daemon=True).start()
 
 
-def _run(cli: HermesCLI, command: str) -> str:
+def _run(
+    cli: HermesCLI, command: str, *, request_deadline: float | None = None
+) -> str:
     cmd = (command or "").strip()
     if not cmd:
         return ""
     if not cmd.startswith("/"):
         cmd = f"/{cmd}"
+    if request_deadline is None:
+        request_deadline = _slash_request_deadline(time.monotonic())
+
+    # HermesCLI captures the initial registry after the normal, short
+    # interactive discovery wait.  A cold profile-local MCP can finish after
+    # that snapshot, so an immediate `/tools` otherwise reports an incomplete
+    # registry for the lifetime of this persistent worker.  Do not wait for
+    # ordinary commands: that would lengthen interactive/model startup and
+    # risks changing a conversation's tool snapshot.  `/tools` is a read-only
+    # registry inspection, so it can safely wait for the same bounded
+    # completion window used by the gateway's late refresh.
+    # `/tools enable|disable|...` are state-changing commands. Only the exact
+    # read-only listing gets the late discovery wait and temporary override.
+    is_tools_command = cmd.lower() == "/tools"
+    tools_wait_s = _tools_mcp_discovery_wait_s(request_deadline) if is_tools_command else None
 
     buf = io.StringIO()
 
@@ -105,13 +143,43 @@ def _run(cli: HermesCLI, command: str) -> str:
     cli.console = Console(file=buf, force_terminal=True, width=120)
 
     old = getattr(cli_mod, "_cprint", None)
+    listing_toolsets = None
+    listing_toolsets_overridden = False
     if old is not None:
         cli_mod._cprint = lambda text: print(text)
 
     try:
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            cli.process_command(cmd)
+        if tools_wait_s is None:
+            wait_scope = contextlib.nullcontext()
+        else:
+            from hermes_cli.mcp_startup import bounded_mcp_discovery_wait
+
+            wait_scope = bounded_mcp_discovery_wait(tools_wait_s)
+        with wait_scope:
+            if tools_wait_s is not None:
+                from hermes_cli.mcp_startup import join_mcp_discovery
+
+                # show_tools() reaches cli.get_tool_definitions(), which normally
+                # does another startup wait.  Keep both joins within this one
+                # request deadline rather than spending the parent timeout twice.
+                if join_mcp_discovery(timeout=tools_wait_s):
+                    # HermesCLI resolved this once during startup, before a
+                    # cold MCP necessarily registered its per-server toolset.
+                    # `/tools` is a read-only inspection command, so refresh
+                    # that listing-only selection after discovery lands.
+                    from hermes_cli.config import load_config
+                    from hermes_cli.tools_config import _get_platform_tools
+
+                    listing_toolsets = cli.enabled_toolsets
+                    cli.enabled_toolsets = sorted(
+                        _get_platform_tools(load_config(), "cli")
+                    )
+                    listing_toolsets_overridden = True
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                cli.process_command(cmd)
     finally:
+        if listing_toolsets_overridden:
+            cli.enabled_toolsets = listing_toolsets
         if old is not None:
             cli_mod._cprint = old
 
@@ -165,9 +233,19 @@ def main():
         _in_flight.set()
         rid = None
         try:
+            received_at = time.monotonic()
             req = json.loads(line)
             rid = req.get("id")
-            out = _run(cli, req.get("command", ""))
+            request_deadline = req.get("deadline_monotonic")
+            if not isinstance(request_deadline, (int, float)) or not math.isfinite(
+                request_deadline
+            ):
+                request_deadline = _slash_request_deadline(received_at)
+            out = _run(
+                cli,
+                req.get("command", ""),
+                request_deadline=request_deadline,
+            )
             sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
             sys.stdout.flush()
         except Exception as e:

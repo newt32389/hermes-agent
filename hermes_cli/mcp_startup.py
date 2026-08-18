@@ -3,12 +3,38 @@
 from __future__ import annotations
 
 import threading
-from contextlib import nullcontext
+import time
+from contextlib import contextmanager, nullcontext
 from typing import Optional
 
 _mcp_discovery_lock = threading.Lock()
 _mcp_discovery_started = False
 _mcp_discovery_thread: Optional[threading.Thread] = None
+_mcp_discovery_wait_deadline = threading.local()
+
+
+@contextmanager
+def bounded_mcp_discovery_wait(timeout: float):
+    """Cap MCP discovery joins on this thread for one bounded operation.
+
+    A caller can perform a deliberate completion wait, then invoke a helper
+    such as ``get_tool_definitions()`` that normally performs its own startup
+    wait.  The shared deadline prevents those nested waits from exceeding the
+    caller's operation budget.  The deadline is thread-local so other
+    sessions/process surfaces retain their normal startup behavior.
+    """
+    prior = getattr(_mcp_discovery_wait_deadline, "value", None)
+    deadline = time.monotonic() + max(0.0, timeout)
+    _mcp_discovery_wait_deadline.value = (
+        min(prior, deadline) if prior is not None else deadline
+    )
+    try:
+        yield
+    finally:
+        if prior is None:
+            del _mcp_discovery_wait_deadline.value
+        else:
+            _mcp_discovery_wait_deadline.value = prior
 
 
 def _has_configured_mcp_servers() -> bool:
@@ -191,7 +217,11 @@ def wait_for_mcp_discovery(
     thread = _mcp_discovery_thread
     if thread is None or not thread.is_alive():
         return
-    thread.join(timeout=_resolve_discovery_timeout(timeout, single_query=single_query))
+    bound = _resolve_discovery_timeout(timeout, single_query=single_query)
+    deadline = getattr(_mcp_discovery_wait_deadline, "value", None)
+    if deadline is not None:
+        bound = min(bound, max(0.0, deadline - time.monotonic()))
+    thread.join(timeout=bound)
 
 
 def mcp_discovery_in_flight() -> bool:
