@@ -11,12 +11,14 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 # Ensure /bin and /usr/bin are on PATH so launchctl/systemctl are discoverable
 # when running under UV's bundled Python which ships a minimal PATH (#3849).
@@ -3173,6 +3175,99 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     return candidates
 
 
+def _normalized_launchd_path_entry(entry: str) -> str | None:
+    """Return a stable absolute lexical PATH entry, or ``None``.
+
+    Keep the lexical form rather than resolving symlinks: a managed Node
+    command can intentionally be a profile-agnostic symlink whose resolved
+    target belongs to a different profile.  The service definition must retain
+    the command directory that the user actually placed on PATH.
+    """
+    if not entry or not os.path.isabs(entry):
+        return None
+    return os.path.normpath(entry)
+
+
+def _is_trusted_launchd_path_entry(entry: str) -> bool:
+    """Whether *entry* satisfies the launchd service PATH trust contract.
+
+    launchd definitions persist across login sessions, so inheriting a shell
+    PATH with a missing or group/world-writable executable directory makes the
+    service both unreliable and unsafe.  This intentionally mirrors the
+    service-plan verifier: a lexical symlink is allowed only when root owns it;
+    its resolved directory must exist, be a directory, be owned by root or the
+    invoking user, and not be writable by group or others.
+    """
+    normalized = _normalized_launchd_path_entry(entry)
+    if normalized is None:
+        return False
+
+    path = Path(normalized)
+    try:
+        lexical_stat = path.lstat()
+        if stat.S_ISLNK(lexical_stat.st_mode) and lexical_stat.st_uid != 0:
+            return False
+        resolved = path.resolve(strict=True)
+        target_stat = resolved.stat()
+    except (OSError, RuntimeError):
+        return False
+
+    current_uid = os.getuid()  # windows-footgun: ok — launchd service helper is POSIX-only
+    return (
+        stat.S_ISDIR(target_stat.st_mode)
+        and target_stat.st_uid in {0, current_uid}
+        and not (target_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+    )
+
+
+def _trusted_launchd_service_path_entries(candidates: list[str]) -> list[str]:
+    """Return trusted, lexical PATH directories in stable first-seen order."""
+    entries: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _normalized_launchd_path_entry(candidate)
+        if (
+            normalized is not None
+            and normalized not in seen
+            and _is_trusted_launchd_path_entry(normalized)
+        ):
+            seen.add(normalized)
+            entries.append(normalized)
+    return entries
+
+
+def _launchd_plist_path_entries(text: str) -> list[str] | None:
+    """Return the lexical PATH entries from a launchd plist, if parseable."""
+    import plistlib
+
+    try:
+        plist = plistlib.loads(text.encode("utf-8"))
+        path_value = plist["EnvironmentVariables"]["PATH"]
+    except (KeyError, TypeError, ValueError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(path_value, str):
+        return None
+    return path_value.split(os.pathsep)
+
+
+def _launchd_plist_path_is_trusted(
+    text: str, *, required_first_entry: str | None = None
+) -> bool:
+    """Return whether an installed plist's PATH remains safe to retain.
+
+    PATH is deliberately excluded from normal staleness comparison so harmless
+    trusted shell differences do not cause service rewrites.  Unsafe or stale
+    entries are different: they must force a rewrite to the generated policy.
+    """
+    entries = _launchd_plist_path_entries(text)
+    if not entries:
+        return False
+    return (
+        (required_first_entry is None or entries[0] == required_first_entry)
+        and entries == _trusted_launchd_service_path_entries(entries)
+    )
+
+
 def _stable_service_working_dir() -> str:
     """Return a WorkingDirectory that will not disappear out from under systemd.
 
@@ -3462,10 +3557,11 @@ def _strip_optional_systemd_directives(text: str) -> str:
 def _normalize_launchd_plist_for_comparison(text: str) -> str:
     """Normalize launchd plist text for staleness checks.
 
-    The generated plist intentionally captures a broad PATH assembled from the
-    invoking shell so user-installed tools remain reachable under launchd.
-    That makes raw text comparison unstable across shells, so ignore the PATH
-    payload when deciding whether the installed plist is stale.
+    The generated plist retains only trusted PATH entries from the invoking
+    shell so user-installed tools remain reachable under launchd.  Trusted
+    PATH differences are harmless and can vary across shells, so ignore their
+    payload when deciding whether the installed plist is stale.  Callers must
+    separately reject an installed PATH that fails the trust contract.
     """
     import re
 
@@ -4585,20 +4681,20 @@ def generate_launchd_plist() -> str:
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
-    # Build a sane PATH for the launchd plist.  launchd provides only a
-    # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
-    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
-    # the systemd unit), then capture the user's full shell PATH so every
-    # user-installed tool (node, ffmpeg, …) is reachable.
+    # launchd provides only a minimal PATH.  Preserve useful user-installed
+    # tools, but only from durable executable directories that satisfy the
+    # launchd service trust contract.  The active venv remains the first entry
+    # whenever it is safe, followed by managed tool dirs and then safe ambient
+    # entries in shell order.
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
     priority_dirs = _build_service_path_dirs()
     _append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(
-        dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
+    sane_path = os.pathsep.join(
+        _trusted_launchd_service_path_entries(
+            priority_dirs + os.environ.get("PATH", "").split(os.pathsep)
         )
     )
 
@@ -4655,7 +4751,7 @@ def generate_launchd_plist() -> str:
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{sane_path}</string>
+        <string>{xml_escape(sane_path)}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
@@ -4702,6 +4798,12 @@ def launchd_plist_is_current() -> bool:
 
     installed = plist_path.read_text(encoding="utf-8")
     expected = generate_launchd_plist()
+    expected_entries = _launchd_plist_path_entries(expected)
+    required_first_entry = expected_entries[0] if expected_entries else None
+    if not _launchd_plist_path_is_trusted(
+        installed, required_first_entry=required_first_entry
+    ):
+        return False
     return _normalize_launchd_plist_for_comparison(
         installed
     ) == _normalize_launchd_plist_for_comparison(expected)
