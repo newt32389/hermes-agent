@@ -160,6 +160,10 @@ try:
 except (ValueError, TypeError):
     _slash_timeout = 45.0
 _SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
+# A cold worker can still be constructing HermesCLI when its first request
+# arrives. Keep enough of the parent timeout for slash rendering + IPC after a
+# bounded discovery wait, rather than letting `/tools` spend the whole budget.
+_SLASH_WORKER_RESPONSE_HEADROOM_S = 3.0
 
 # When a WebSocket client (the dashboard's embedded-chat tab / desktop app)
 # disconnects, ``tui_gateway.ws`` detaches the transport but intentionally
@@ -484,7 +488,25 @@ class _SlashWorker:
         with self._lock:
             self._seq += 1
             rid = self._seq
-            self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
+            # The worker may still be finishing its own startup when this
+            # request arrives. Pass the parent's monotonic deadline so a
+            # bounded discovery wait cannot outlive this request and produce
+            # a 5030 despite the worker eventually replying.
+            request_deadline = (
+                time.monotonic()
+                + _SLASH_WORKER_TIMEOUT_S
+                - _SLASH_WORKER_RESPONSE_HEADROOM_S
+            )
+            self.proc.stdin.write(
+                json.dumps(
+                    {
+                        "id": rid,
+                        "command": command,
+                        "deadline_monotonic": request_deadline,
+                    }
+                )
+                + "\n"
+            )
             self.proc.stdin.flush()
 
             while True:
